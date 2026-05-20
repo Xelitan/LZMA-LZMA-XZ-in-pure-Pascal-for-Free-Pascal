@@ -1,3 +1,7 @@
+# LZMA, LZMA2 and XZ
+
+Ported from liblzma, which is distributed under the BSD Zero Clause License (0BSD).
+
 # Usage
 
 ```
