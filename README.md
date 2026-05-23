@@ -2,6 +2,8 @@
 
 Ported from liblzma, which is distributed under the BSD Zero Clause License (0BSD).
 
+# Works in Lazarus and Delphi XE
+
 # Usage
 
 ```
