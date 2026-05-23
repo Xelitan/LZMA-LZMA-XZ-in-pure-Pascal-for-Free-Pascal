@@ -18,4 +18,10 @@ procedure LZMA2DeCompressFile(const InFile, OutFile: String); //unpacks .xz
 
 procedure LZMA2Compress(const InStr, OutStr: TStream);
 procedure LZMA2DeCompress(const InStr, OutStr: TStream);
+
+function LZMA(const Uncompressed: AnsiString): AnsiString;
+function UnLZMA(const Compressed: AnsiString): AnsiString;
+
+function XZ(const Uncompressed: AnsiString): AnsiString;
+function UnXZ(const Compressed: AnsiString): AnsiString;
 ```
