@@ -1,5 +1,6 @@
-unit LZMASimple;
-{$mode delphi}
+﻿unit LZMASimple;
+
+{$IFDEF FPC}{$mode delphi}{$ENDIF}
 {$Q-}{$R-}
 
 interface
@@ -32,9 +33,26 @@ procedure LZMA2CompressEx(const InStr, OutStr: TStream; Level: Integer = 6;
                            BCJ: TBCJFilter = bcjNone;
                            DeltaDist: Integer = 0);
 
+function LZMA(const Uncompressed: AnsiString): AnsiString;
+function UnLZMA(const Compressed: AnsiString): AnsiString;
+
+function XZ(const Uncompressed: AnsiString): AnsiString;
+function UnXZ(const Compressed: AnsiString): AnsiString;
+
 implementation
 
 uses SHA256;
+
+{$IFNDEF FPC}
+{$POINTERMATH ON}
+type
+  TStreamHelper = class helper for TStream
+    procedure WriteByte(b: Byte);
+    function ReadByte: Byte;
+  end;
+procedure TStreamHelper.WriteByte(b: Byte); begin WriteBuffer(b, 1); end;
+function TStreamHelper.ReadByte: Byte; begin ReadBuffer(Result, 1); end;
+{$ENDIF}
 
 // ===========================================================================
 // Endian helpers
@@ -47,7 +65,12 @@ begin
 end;
 
 procedure Write32LE(p: PByte; v: LongWord); inline;
-begin p[0]:=v; p[1]:=v shr 8; p[2]:=v shr 16; p[3]:=v shr 24; end;
+begin
+  p[0]:=v; 
+  p[1]:=v shr 8; 
+  p[2]:=v shr 16; 
+  p[3]:=v shr 24; 
+end;
 
 function Read32BE(p: PByte): LongWord; inline;
 begin
@@ -56,7 +79,12 @@ begin
 end;
 
 procedure Write32BE(p: PByte; v: LongWord); inline;
-begin p[0]:=v shr 24; p[1]:=v shr 16; p[2]:=v shr 8; p[3]:=v; end;
+begin 
+  p[0]:=v shr 24; 
+  p[1]:=v shr 16; 
+  p[2]:=v shr 8; 
+  p[3]:=v; 
+end;
 
 // ===========================================================================
 // CRC32
@@ -76,92 +104,94 @@ begin
 end;
 
 function CRC32Update(crc: LongWord; buf: PByte; len: LongWord): LongWord;
-var i: LongWord;
 begin
-  crc:=crc xor $FFFFFFFF;
-  for i:=0 to len-1 do
-    crc:=CRCTable[Byte(crc) xor buf[i]] xor (crc shr 8);
-  Result:=crc xor $FFFFFFFF;
+  crc := crc xor $FFFFFFFF;
+  while len > 0 do begin
+    crc := CRCTable[Byte(crc) xor buf^] xor (crc shr 8);
+    Inc(buf); Dec(len);
+  end;
+  Result := crc xor $FFFFFFFF;
 end;
 
 // ===========================================================================
 // CRC64 — XZ variant (poly=0xC96C5795D7870F42, init=all-1s, finalXOR=all-1s)
 // ===========================================================================
 
-const CRC64Table: array[0..255] of QWord = (
-  QWord($0000000000000000),QWord($B32E4CBE03A75F6F),QWord($F4843657A840A05B),QWord($47AA7AE9ABE7FF34),
-  QWord($7BD0C384FF8F5E33),QWord($C8FE8F3AFC28015C),QWord($8F54F5D357CFFE68),QWord($3C7AB96D5468A107),
-  QWord($F7A18709FF1EBC66),QWord($448FCBB7FCB9E309),QWord($0325B15E575E1C3D),QWord($B00BFDE054F94352),
-  QWord($8C71448D0091E255),QWord($3F5F08330336BD3A),QWord($78F572DAA8D1420E),QWord($CBDB3E64AB761D61),
-  QWord($7D9BA13851336649),QWord($CEB5ED8652943926),QWord($891F976FF973C612),QWord($3A31DBD1FAD4997D),
-  QWord($064B62BCAEBC387A),QWord($B5652E02AD1B6715),QWord($F2CF54EB06FC9821),QWord($41E11855055BC74E),
-  QWord($8A3A2631AE2DDA2F),QWord($39146A8FAD8A8540),QWord($7EBE1066066D7A74),QWord($CD905CD805CA251B),
-  QWord($F1EAE5B551A2841C),QWord($42C4A90B5205DB73),QWord($056ED3E2F9E22447),QWord($B6409F5CFA457B28),
-  QWord($FB374270A266CC92),QWord($48190ECEA1C193FD),QWord($0FB374270A266CC9),QWord($BC9D3899098133A6),
-  QWord($80E781F45DE992A1),QWord($33C9CD4A5E4ECDCE),QWord($7463B7A3F5A932FA),QWord($C74DFB1DF60E6D95),
-  QWord($0C96C5795D7870F4),QWord($BFB889C75EDF2F9B),QWord($F812F32EF538D0AF),QWord($4B3CBF90F69F8FC0),
-  QWord($774606FDA2F72EC7),QWord($C4684A43A15071A8),QWord($83C230AA0AB78E9C),QWord($30EC7C140910D1F3),
-  QWord($86ACE348F355AADB),QWord($3582AFF6F0F2F5B4),QWord($7228D51F5B150A80),QWord($C10699A158B255EF),
-  QWord($FD7C20CC0CDAF4E8),QWord($4E526C720F7DAB87),QWord($09F8169BA49A54B3),QWord($BAD65A25A73D0BDC),
-  QWord($710D64410C4B16BD),QWord($C22328FF0FEC49D2),QWord($85895216A40BB6E6),QWord($36A71EA8A7ACE989),
-  QWord($0ADDA7C5F3C4488E),QWord($B9F3EB7BF06317E1),QWord($FE5991925B84E8D5),QWord($4D77DD2C5823B7BA),
-  QWord($64B62BCAEBC387A1),QWord($D7986774E864D8CE),QWord($90321D9D438327FA),QWord($231C512340247895),
-  QWord($1F66E84E144CD992),QWord($AC48A4F017EB86FD),QWord($EBE2DE19BC0C79C9),QWord($58CC92A7BFAB26A6),
-  QWord($9317ACC314DD3BC7),QWord($2039E07D177A64A8),QWord($67939A94BC9D9B9C),QWord($D4BDD62ABF3AC4F3),
-  QWord($E8C76F47EB5265F4),QWord($5BE923F9E8F53A9B),QWord($1C4359104312C5AF),QWord($AF6D15AE40B59AC0),
-  QWord($192D8AF2BAF0E1E8),QWord($AA03C64CB957BE87),QWord($EDA9BCA512B041B3),QWord($5E87F01B11171EDC),
-  QWord($62FD4976457FBFDB),QWord($D1D305C846D8E0B4),QWord($96797F21ED3F1F80),QWord($2557339FEE9840EF),
-  QWord($EE8C0DFB45EE5D8E),QWord($5DA24145464902E1),QWord($1A083BACEDAEFDD5),QWord($A9267712EE09A2BA),
-  QWord($955CCE7FBA6103BD),QWord($267282C1B9C65CD2),QWord($61D8F8281221A3E6),QWord($D2F6B4961186FC89),
-  QWord($9F8169BA49A54B33),QWord($2CAF25044A02145C),QWord($6B055FEDE1E5EB68),QWord($D82B1353E242B407),
-  QWord($E451AA3EB62A1500),QWord($577FE680B58D4A6F),QWord($10D59C691E6AB55B),QWord($A3FBD0D71DCDEA34),
-  QWord($6820EEB3B6BBF755),QWord($DB0EA20DB51CA83A),QWord($9CA4D8E41EFB570E),QWord($2F8A945A1D5C0861),
-  QWord($13F02D374934A966),QWord($A0DE61894A93F609),QWord($E7741B60E174093D),QWord($545A57DEE2D35652),
-  QWord($E21AC88218962D7A),QWord($5134843C1B317215),QWord($169EFED5B0D68D21),QWord($A5B0B26BB371D24E),
-  QWord($99CA0B06E7197349),QWord($2AE447B8E4BE2C26),QWord($6D4E3D514F59D312),QWord($DE6071EF4CFE8C7D),
-  QWord($15BB4F8BE788911C),QWord($A6950335E42FCE73),QWord($E13F79DC4FC83147),QWord($521135624C6F6E28),
-  QWord($6E6B8C0F1807CF2F),QWord($DD45C0B11BA09040),QWord($9AEFBA58B0476F74),QWord($29C1F6E6B3E0301B),
-  QWord($C96C5795D7870F42),QWord($7A421B2BD420502D),QWord($3DE861C27FC7AF19),QWord($8EC62D7C7C60F076),
-  QWord($B2BC941128085171),QWord($0192D8AF2BAF0E1E),QWord($4638A2468048F12A),QWord($F516EEF883EFAE45),
-  QWord($3ECDD09C2899B324),QWord($8DE39C222B3EEC4B),QWord($CA49E6CB80D9137F),QWord($7967AA75837E4C10),
-  QWord($451D1318D716ED17),QWord($F6335FA6D4B1B278),QWord($B199254F7F564D4C),QWord($02B769F17CF11223),
-  QWord($B4F7F6AD86B4690B),QWord($07D9BA1385133664),QWord($4073C0FA2EF4C950),QWord($F35D8C442D53963F),
-  QWord($CF273529793B3738),QWord($7C0979977A9C6857),QWord($3BA3037ED17B9763),QWord($888D4FC0D2DCC80C),
-  QWord($435671A479AAD56D),QWord($F0783D1A7A0D8A02),QWord($B7D247F3D1EA7536),QWord($04FC0B4DD24D2A59),
-  QWord($3886B22086258B5E),QWord($8BA8FE9E8582D431),QWord($CC0284772E652B05),QWord($7F2CC8C92DC2746A),
-  QWord($325B15E575E1C3D0),QWord($8175595B76469CBF),QWord($C6DF23B2DDA1638B),QWord($75F16F0CDE063CE4),
-  QWord($498BD6618A6E9DE3),QWord($FAA59ADF89C9C28C),QWord($BD0FE036222E3DB8),QWord($0E21AC88218962D7),
-  QWord($C5FA92EC8AFF7FB6),QWord($76D4DE52895820D9),QWord($317EA4BB22BFDFED),QWord($8250E80521188082),
-  QWord($BE2A516875702185),QWord($0D041DD676D77EEA),QWord($4AAE673FDD3081DE),QWord($F9802B81DE97DEB1),
-  QWord($4FC0B4DD24D2A599),QWord($FCEEF8632775FAF6),QWord($BB44828A8C9205C2),QWord($086ACE348F355AAD),
-  QWord($34107759DB5DFBAA),QWord($873E3BE7D8FAA4C5),QWord($C094410E731D5BF1),QWord($73BA0DB070BA049E),
-  QWord($B86133D4DBCC19FF),QWord($0B4F7F6AD86B4690),QWord($4CE50583738CB9A4),QWord($FFCB493D702BE6CB),
-  QWord($C3B1F050244347CC),QWord($709FBCEE27E418A3),QWord($3735C6078C03E797),QWord($841B8AB98FA4B8F8),
-  QWord($ADDA7C5F3C4488E3),QWord($1EF430E13FE3D78C),QWord($595E4A08940428B8),QWord($EA7006B697A377D7),
-  QWord($D60ABFDBC3CBD6D0),QWord($6524F365C06C89BF),QWord($228E898C6B8B768B),QWord($91A0C532682C29E4),
-  QWord($5A7BFB56C35A3485),QWord($E955B7E8C0FD6BEA),QWord($AEFFCD016B1A94DE),QWord($1DD181BF68BDCBB1),
-  QWord($21AB38D23CD56AB6),QWord($9285746C3F7235D9),QWord($D52F0E859495CAED),QWord($6601423B97329582),
-  QWord($D041DD676D77EEAA),QWord($636F91D96ED0B1C5),QWord($24C5EB30C5374EF1),QWord($97EBA78EC690119E),
-  QWord($AB911EE392F8B099),QWord($18BF525D915FEFF6),QWord($5F1528B43AB810C2),QWord($EC3B640A391F4FAD),
-  QWord($27E05A6E926952CC),QWord($94CE16D091CE0DA3),QWord($D3646C393A29F297),QWord($604A2087398EADF8),
-  QWord($5C3099EA6DE60CFF),QWord($EF1ED5546E415390),QWord($A8B4AFBDC5A6ACA4),QWord($1B9AE303C601F3CB),
-  QWord($56ED3E2F9E224471),QWord($E5C372919D851B1E),QWord($A26908783662E42A),QWord($114744C635C5BB45),
-  QWord($2D3DFDAB61AD1A42),QWord($9E13B115620A452D),QWord($D9B9CBFCC9EDBA19),QWord($6A978742CA4AE576),
-  QWord($A14CB926613CF817),QWord($1262F598629BA778),QWord($55C88F71C97C584C),QWord($E6E6C3CFCADB0723),
-  QWord($DA9C7AA29EB3A624),QWord($69B2361C9D14F94B),QWord($2E184CF536F3067F),QWord($9D36004B35545910),
-  QWord($2B769F17CF112238),QWord($9858D3A9CCB67D57),QWord($DFF2A94067518263),QWord($6CDCE5FE64F6DD0C),
-  QWord($50A65C93309E7C0B),QWord($E388102D33392364),QWord($A4226AC498DEDC50),QWord($170C267A9B79833F),
-  QWord($DCD7181E300F9E5E),QWord($6FF954A033A8C131),QWord($28532E49984F3E05),QWord($9B7D62F79BE8616A),
-  QWord($A707DB9ACF80C06D),QWord($14299724CC279F02),QWord($5383EDCD67C06036),QWord($E0ADA17364673F59)
+const CRC64Table: array[0..255] of UInt64 = (
+  UInt64($0000000000000000),UInt64($B32E4CBE03A75F6F),UInt64($F4843657A840A05B),UInt64($47AA7AE9ABE7FF34),
+  UInt64($7BD0C384FF8F5E33),UInt64($C8FE8F3AFC28015C),UInt64($8F54F5D357CFFE68),UInt64($3C7AB96D5468A107),
+  UInt64($F7A18709FF1EBC66),UInt64($448FCBB7FCB9E309),UInt64($0325B15E575E1C3D),UInt64($B00BFDE054F94352),
+  UInt64($8C71448D0091E255),UInt64($3F5F08330336BD3A),UInt64($78F572DAA8D1420E),UInt64($CBDB3E64AB761D61),
+  UInt64($7D9BA13851336649),UInt64($CEB5ED8652943926),UInt64($891F976FF973C612),UInt64($3A31DBD1FAD4997D),
+  UInt64($064B62BCAEBC387A),UInt64($B5652E02AD1B6715),UInt64($F2CF54EB06FC9821),UInt64($41E11855055BC74E),
+  UInt64($8A3A2631AE2DDA2F),UInt64($39146A8FAD8A8540),UInt64($7EBE1066066D7A74),UInt64($CD905CD805CA251B),
+  UInt64($F1EAE5B551A2841C),UInt64($42C4A90B5205DB73),UInt64($056ED3E2F9E22447),UInt64($B6409F5CFA457B28),
+  UInt64($FB374270A266CC92),UInt64($48190ECEA1C193FD),UInt64($0FB374270A266CC9),UInt64($BC9D3899098133A6),
+  UInt64($80E781F45DE992A1),UInt64($33C9CD4A5E4ECDCE),UInt64($7463B7A3F5A932FA),UInt64($C74DFB1DF60E6D95),
+  UInt64($0C96C5795D7870F4),UInt64($BFB889C75EDF2F9B),UInt64($F812F32EF538D0AF),UInt64($4B3CBF90F69F8FC0),
+  UInt64($774606FDA2F72EC7),UInt64($C4684A43A15071A8),UInt64($83C230AA0AB78E9C),UInt64($30EC7C140910D1F3),
+  UInt64($86ACE348F355AADB),UInt64($3582AFF6F0F2F5B4),UInt64($7228D51F5B150A80),UInt64($C10699A158B255EF),
+  UInt64($FD7C20CC0CDAF4E8),UInt64($4E526C720F7DAB87),UInt64($09F8169BA49A54B3),UInt64($BAD65A25A73D0BDC),
+  UInt64($710D64410C4B16BD),UInt64($C22328FF0FEC49D2),UInt64($85895216A40BB6E6),UInt64($36A71EA8A7ACE989),
+  UInt64($0ADDA7C5F3C4488E),UInt64($B9F3EB7BF06317E1),UInt64($FE5991925B84E8D5),UInt64($4D77DD2C5823B7BA),
+  UInt64($64B62BCAEBC387A1),UInt64($D7986774E864D8CE),UInt64($90321D9D438327FA),UInt64($231C512340247895),
+  UInt64($1F66E84E144CD992),UInt64($AC48A4F017EB86FD),UInt64($EBE2DE19BC0C79C9),UInt64($58CC92A7BFAB26A6),
+  UInt64($9317ACC314DD3BC7),UInt64($2039E07D177A64A8),UInt64($67939A94BC9D9B9C),UInt64($D4BDD62ABF3AC4F3),
+  UInt64($E8C76F47EB5265F4),UInt64($5BE923F9E8F53A9B),UInt64($1C4359104312C5AF),UInt64($AF6D15AE40B59AC0),
+  UInt64($192D8AF2BAF0E1E8),UInt64($AA03C64CB957BE87),UInt64($EDA9BCA512B041B3),UInt64($5E87F01B11171EDC),
+  UInt64($62FD4976457FBFDB),UInt64($D1D305C846D8E0B4),UInt64($96797F21ED3F1F80),UInt64($2557339FEE9840EF),
+  UInt64($EE8C0DFB45EE5D8E),UInt64($5DA24145464902E1),UInt64($1A083BACEDAEFDD5),UInt64($A9267712EE09A2BA),
+  UInt64($955CCE7FBA6103BD),UInt64($267282C1B9C65CD2),UInt64($61D8F8281221A3E6),UInt64($D2F6B4961186FC89),
+  UInt64($9F8169BA49A54B33),UInt64($2CAF25044A02145C),UInt64($6B055FEDE1E5EB68),UInt64($D82B1353E242B407),
+  UInt64($E451AA3EB62A1500),UInt64($577FE680B58D4A6F),UInt64($10D59C691E6AB55B),UInt64($A3FBD0D71DCDEA34),
+  UInt64($6820EEB3B6BBF755),UInt64($DB0EA20DB51CA83A),UInt64($9CA4D8E41EFB570E),UInt64($2F8A945A1D5C0861),
+  UInt64($13F02D374934A966),UInt64($A0DE61894A93F609),UInt64($E7741B60E174093D),UInt64($545A57DEE2D35652),
+  UInt64($E21AC88218962D7A),UInt64($5134843C1B317215),UInt64($169EFED5B0D68D21),UInt64($A5B0B26BB371D24E),
+  UInt64($99CA0B06E7197349),UInt64($2AE447B8E4BE2C26),UInt64($6D4E3D514F59D312),UInt64($DE6071EF4CFE8C7D),
+  UInt64($15BB4F8BE788911C),UInt64($A6950335E42FCE73),UInt64($E13F79DC4FC83147),UInt64($521135624C6F6E28),
+  UInt64($6E6B8C0F1807CF2F),UInt64($DD45C0B11BA09040),UInt64($9AEFBA58B0476F74),UInt64($29C1F6E6B3E0301B),
+  UInt64($C96C5795D7870F42),UInt64($7A421B2BD420502D),UInt64($3DE861C27FC7AF19),UInt64($8EC62D7C7C60F076),
+  UInt64($B2BC941128085171),UInt64($0192D8AF2BAF0E1E),UInt64($4638A2468048F12A),UInt64($F516EEF883EFAE45),
+  UInt64($3ECDD09C2899B324),UInt64($8DE39C222B3EEC4B),UInt64($CA49E6CB80D9137F),UInt64($7967AA75837E4C10),
+  UInt64($451D1318D716ED17),UInt64($F6335FA6D4B1B278),UInt64($B199254F7F564D4C),UInt64($02B769F17CF11223),
+  UInt64($B4F7F6AD86B4690B),UInt64($07D9BA1385133664),UInt64($4073C0FA2EF4C950),UInt64($F35D8C442D53963F),
+  UInt64($CF273529793B3738),UInt64($7C0979977A9C6857),UInt64($3BA3037ED17B9763),UInt64($888D4FC0D2DCC80C),
+  UInt64($435671A479AAD56D),UInt64($F0783D1A7A0D8A02),UInt64($B7D247F3D1EA7536),UInt64($04FC0B4DD24D2A59),
+  UInt64($3886B22086258B5E),UInt64($8BA8FE9E8582D431),UInt64($CC0284772E652B05),UInt64($7F2CC8C92DC2746A),
+  UInt64($325B15E575E1C3D0),UInt64($8175595B76469CBF),UInt64($C6DF23B2DDA1638B),UInt64($75F16F0CDE063CE4),
+  UInt64($498BD6618A6E9DE3),UInt64($FAA59ADF89C9C28C),UInt64($BD0FE036222E3DB8),UInt64($0E21AC88218962D7),
+  UInt64($C5FA92EC8AFF7FB6),UInt64($76D4DE52895820D9),UInt64($317EA4BB22BFDFED),UInt64($8250E80521188082),
+  UInt64($BE2A516875702185),UInt64($0D041DD676D77EEA),UInt64($4AAE673FDD3081DE),UInt64($F9802B81DE97DEB1),
+  UInt64($4FC0B4DD24D2A599),UInt64($FCEEF8632775FAF6),UInt64($BB44828A8C9205C2),UInt64($086ACE348F355AAD),
+  UInt64($34107759DB5DFBAA),UInt64($873E3BE7D8FAA4C5),UInt64($C094410E731D5BF1),UInt64($73BA0DB070BA049E),
+  UInt64($B86133D4DBCC19FF),UInt64($0B4F7F6AD86B4690),UInt64($4CE50583738CB9A4),UInt64($FFCB493D702BE6CB),
+  UInt64($C3B1F050244347CC),UInt64($709FBCEE27E418A3),UInt64($3735C6078C03E797),UInt64($841B8AB98FA4B8F8),
+  UInt64($ADDA7C5F3C4488E3),UInt64($1EF430E13FE3D78C),UInt64($595E4A08940428B8),UInt64($EA7006B697A377D7),
+  UInt64($D60ABFDBC3CBD6D0),UInt64($6524F365C06C89BF),UInt64($228E898C6B8B768B),UInt64($91A0C532682C29E4),
+  UInt64($5A7BFB56C35A3485),UInt64($E955B7E8C0FD6BEA),UInt64($AEFFCD016B1A94DE),UInt64($1DD181BF68BDCBB1),
+  UInt64($21AB38D23CD56AB6),UInt64($9285746C3F7235D9),UInt64($D52F0E859495CAED),UInt64($6601423B97329582),
+  UInt64($D041DD676D77EEAA),UInt64($636F91D96ED0B1C5),UInt64($24C5EB30C5374EF1),UInt64($97EBA78EC690119E),
+  UInt64($AB911EE392F8B099),UInt64($18BF525D915FEFF6),UInt64($5F1528B43AB810C2),UInt64($EC3B640A391F4FAD),
+  UInt64($27E05A6E926952CC),UInt64($94CE16D091CE0DA3),UInt64($D3646C393A29F297),UInt64($604A2087398EADF8),
+  UInt64($5C3099EA6DE60CFF),UInt64($EF1ED5546E415390),UInt64($A8B4AFBDC5A6ACA4),UInt64($1B9AE303C601F3CB),
+  UInt64($56ED3E2F9E224471),UInt64($E5C372919D851B1E),UInt64($A26908783662E42A),UInt64($114744C635C5BB45),
+  UInt64($2D3DFDAB61AD1A42),UInt64($9E13B115620A452D),UInt64($D9B9CBFCC9EDBA19),UInt64($6A978742CA4AE576),
+  UInt64($A14CB926613CF817),UInt64($1262F598629BA778),UInt64($55C88F71C97C584C),UInt64($E6E6C3CFCADB0723),
+  UInt64($DA9C7AA29EB3A624),UInt64($69B2361C9D14F94B),UInt64($2E184CF536F3067F),UInt64($9D36004B35545910),
+  UInt64($2B769F17CF112238),UInt64($9858D3A9CCB67D57),UInt64($DFF2A94067518263),UInt64($6CDCE5FE64F6DD0C),
+  UInt64($50A65C93309E7C0B),UInt64($E388102D33392364),UInt64($A4226AC498DEDC50),UInt64($170C267A9B79833F),
+  UInt64($DCD7181E300F9E5E),UInt64($6FF954A033A8C131),UInt64($28532E49984F3E05),UInt64($9B7D62F79BE8616A),
+  UInt64($A707DB9ACF80C06D),UInt64($14299724CC279F02),UInt64($5383EDCD67C06036),UInt64($E0ADA17364673F59)
 );
 
-function CRC64Update(crc: QWord; buf: PByte; len: LongWord): QWord;
-var i: LongWord;
+function CRC64Update(crc: UInt64; buf: PByte; len: LongWord): UInt64;
 begin
-  crc := crc xor QWord($FFFFFFFFFFFFFFFF);
-  for i := 0 to len - 1 do
-    crc := CRC64Table[Byte(crc) xor buf[i]] xor (crc shr 8);
-  Result := crc xor QWord($FFFFFFFFFFFFFFFF);
+  crc := crc xor UInt64($FFFFFFFFFFFFFFFF);
+  while len > 0 do begin
+    crc := CRC64Table[Byte(crc) xor buf^] xor (crc shr 8);
+    Inc(buf); Dec(len);
+  end;
+  Result := crc xor UInt64($FFFFFFFFFFFFFFFF);
 end;
 
 // ===========================================================================
@@ -253,22 +283,36 @@ end;
 
 type
   TRangeEnc = record
-    Low: Int64; Range: LongWord; Cache: Byte; CacheSize: Int64;
+    Low: Int64; 
+    Range: LongWord; 
+    Cache: Byte; 
+    CacheSize: Int64;
     OutStream: TStream;
   end;
 
 procedure RCEncInit(var rc: TRangeEnc; OutStr: TStream);
-begin rc.Low:=0; rc.Range:=$FFFFFFFF; rc.Cache:=0; rc.CacheSize:=1; rc.OutStream:=OutStr; end;
+begin 
+  rc.Low:=0; 
+  rc.Range:=$FFFFFFFF; 
+  rc.Cache:=0; 
+  rc.CacheSize:=1; 
+  rc.OutStream:=OutStr; 
+end;
 
 procedure RCShiftLow(var rc: TRangeEnc);
 var b: Byte;
 begin
-  if (LongWord(rc.Low)<$FF000000) or (rc.Low shr 32<>0) then begin
+  if (LongWord(rc.Low)<$FF000000) or (rc.Low shr 32<>0) then 
+  begin
     b:=rc.Cache+Byte(rc.Low shr 32);
     rc.Cache:=Byte(rc.Low shr 24);
     rc.OutStream.WriteByte(b);
     b:=Byte($FF+(rc.Low shr 32));
-    while rc.CacheSize>1 do begin rc.OutStream.WriteByte(b); Dec(rc.CacheSize); end;
+    while rc.CacheSize>1 do 
+    begin 
+      rc.OutStream.WriteByte(b); 
+      Dec(rc.CacheSize); 
+    end;
   end else Inc(rc.CacheSize);
   rc.Low:=LongWord(rc.Low) shl 8;
 end;
@@ -635,7 +679,10 @@ procedure DecodeLZMAProps(b: Byte; out lc, lp, pb: Integer);
 var v: Integer;
 begin
   if b>224 then raise ELZMAError.Create('Invalid LZMA props byte');
-  pb:=b div 45; v:=b-pb*45; lp:=v div 9; lc:=v mod 9;
+  pb:=b div 45; 
+  v:=b-pb*45; 
+  lp:=v div 9; 
+  lc:=v mod 9;
 end;
 
 // ===========================================================================
@@ -653,17 +700,35 @@ type
   end;
 
 constructor TLimitedStream.Create(Src: TStream; Limit: Int64);
-begin inherited Create; FSrc:=Src; FLeft:=Limit; end;
+begin 
+  inherited Create; 
+  FSrc:=Src; 
+  FLeft:=Limit; 
+end;
+
 function TLimitedStream.Read(var Buffer; Count: Longint): Longint;
 begin
   if Count>FLeft then Count:=FLeft;
-  if Count=0 then begin Result:=0; Exit; end;
-  Result:=FSrc.Read(Buffer,Count); Dec(FLeft,Result);
+  if Count=0 then 
+  begin 
+    Result:=0; 
+    Exit; 
+  end;
+  Result:=FSrc.Read(Buffer,Count);  
+  Dec(FLeft,Result);
 end;
+
 function TLimitedStream.Write(const Buffer; Count: Longint): Longint;
-begin Result:=0; raise ELZMAError.Create('TLimitedStream: read-only'); end;
+begin 
+  Result:=0; 
+  raise ELZMAError.Create('TLimitedStream: read-only'); 
+end;
+
 function TLimitedStream.Seek(const Offset: Int64; Origin: TSeekOrigin): Int64;
-begin Result:=0; raise ELZMAError.Create('TLimitedStream: no seek'); end;
+begin 
+  Result:=0; 
+  raise ELZMAError.Create('TLimitedStream: no seek'); 
+end;
 
 // ===========================================================================
 // LZMA1 decode to output stream
@@ -732,7 +797,8 @@ end;
 function MFMinBytes(kind: TMatchFinderKind): Integer; inline;
 begin
   case kind of
-    mfkBT2: Result:=2; mfkHC3,mfkBT3: Result:=3;
+    mfkBT2:        Result:=2; 
+    mfkHC3,mfkBT3: Result:=3;
   else Result:=4;
   end;
 end;
@@ -744,8 +810,11 @@ begin
   mf.Kind:=kind; mf.Buf:=buf; mf.BufSize:=bufSize;
   mf.NiceLen:=niceLen; mf.MaxDepth:=maxDepth; mf.Pos:=0;
   // CyclicSize = next power of 2 >= min(bufSize, dictSize)
-  v:=dictSize; if bufSize<v then v:=bufSize; if v<1 then v:=1;
-  cyclicSize:=1; while cyclicSize<v do cyclicSize:=cyclicSize shl 1;
+  v:=dictSize; 
+  if bufSize<v then v:=bufSize; 
+  if v<1 then v:=1;
+  cyclicSize:=1; 
+  while cyclicSize<v do cyclicSize:=cyclicSize shl 1;
   mf.CyclicMask:=cyclicSize-1;
   case kind of
     mfkBT2,mfkHC3,mfkBT3: hashSz:=65536;
@@ -763,8 +832,16 @@ end;
 
 procedure MFFree(var mf: TMatchFinder);
 begin
-  if mf.Hash<>nil then begin FreeMem(mf.Hash); mf.Hash:=nil; end;
-  if mf.Son<>nil then begin FreeMem(mf.Son); mf.Son:=nil; end;
+  if mf.Hash<>nil then 
+  begin 
+    FreeMem(mf.Hash); 
+    mf.Hash:=nil; 
+  end;
+  if mf.Son<>nil then 
+  begin 
+    FreeMem(mf.Son); 
+    mf.Son:=nil; 
+  end;
 end;
 
 // HC find+insert at mf.Pos; returns best (len, dist-1)
@@ -1062,26 +1139,21 @@ begin
 end;
 
 // SPARC BCJ (big-endian)
+// Handles CALL (instr shr 22 = $100, byte[0]=$40) and
+// BICC/FBICC (instr shr 22 = $1FF, byte[0]=$7F, byte[1] top 2 bits=$C0).
+// Both patterns have bits[31:30]=01, so the same transform applies to each.
+// Reference: XZ Utils liblzma/simple/sparc.c
 procedure ImplBCJsparc(buf: PByte; size: LongWord; isEncode: Boolean);
 var i: LongWord; src, dest, instr: LongWord;
 begin
   i:=0;
   while i+4<=size do begin
     instr:=Read32BE(buf+i);
-    if (buf[i]=$40) and ((buf[i+1] and $C0)=0) then begin
-      // CALL
+    if (instr shr 22 = $100) or (instr shr 22 = $1FF) then begin
       src:=(instr and $3FFFFFFF) shl 2;
       if isEncode then dest:=i+src else dest:=src-i;
-      dest:=dest shr 2;
-      dest:=(LongWord(0)-(dest and $00200000)) or $40000000 or (dest and $3FFFFF);
-      Write32BE(buf+i,(instr and $C0000000) or (dest and $3FFFFFFF));
-    end else if (buf[i]=$7F) and ((buf[i+1] and $C0)=$C0) then begin
-      // FBICC
-      src:=(instr and $3FFFFFFF) shl 2;
-      if isEncode then dest:=i+src else dest:=src-i;
-      dest:=dest shr 2;
-      dest:=(LongWord(0)-(dest and $00200000)) or $40000000 or (dest and $3FFFFF);
-      Write32BE(buf+i,(instr and $C0000000) or (dest and $3FFFFFFF));
+      instr:=$40000000 or ((dest shr 2) and $3FFFFFFF);
+      Write32BE(buf+i, instr);
     end;
     Inc(i,4);
   end;
@@ -1105,7 +1177,7 @@ begin
       end;
       Write32LE(buf+i,instr);
     end else if (instr and $9F000000)=$90000000 then begin
-      // ADRP — only ±512 MiB range
+      // ADRP — only +/-512 MiB range
       src:=((instr shr 29) and 3) or ((instr shr 3) and $001FFFFC);
       if ((src+$00020000) and $001C0000)<>0 then begin Inc(i,4); continue; end;
       instr:=instr and $9000001F; pc:=pc shr 12;
@@ -1135,20 +1207,26 @@ end;
 function BCJFilterID(bcj: TBCJFilter): Byte;
 begin
   case bcj of
-    bcjX86:      Result:=$04; bcjPowerPC: Result:=$05;
-    bcjIA64:     Result:=$06; bcjARM:     Result:=$07;
-    bcjARMThumb: Result:=$08; bcjSPARC:   Result:=$09;
+    bcjX86:      Result:=$04;
+    bcjPowerPC:  Result:=$05;
+    bcjIA64:     Result:=$06; 
+    bcjARM:      Result:=$07;
+    bcjARMThumb: Result:=$08; 
+    bcjSPARC:    Result:=$09;
     bcjARM64:    Result:=$0A;
-  else Result:=$04;
+  else           Result:=$04;
   end;
 end;
 
 function BCJFromID(id: Byte): TBCJFilter;
 begin
   case id of
-    $04: Result:=bcjX86;     $05: Result:=bcjPowerPC;
-    $06: Result:=bcjIA64;    $07: Result:=bcjARM;
-    $08: Result:=bcjARMThumb;$09: Result:=bcjSPARC;
+    $04: Result:=bcjX86;     
+    $05: Result:=bcjPowerPC;
+    $06: Result:=bcjIA64;
+    $07: Result:=bcjARM;
+    $08: Result:=bcjARMThumb;
+    $09: Result:=bcjSPARC;
     $0A: Result:=bcjARM64;
   else Result:=bcjNone;
   end;
@@ -1185,7 +1263,10 @@ var
   propsByte: Byte; chunkStart, uncompSize, compSize: LongWord;
   chunkMem: TMemoryStream; firstChunk: Boolean; ctrl: Byte;
 begin
-  propsByte:=Byte((pb*5+lp)*9+lc); firstChunk:=True; chunkStart:=0;
+  propsByte:=Byte((pb*5+lp)*9+lc); 
+  firstChunk:=True; 
+  chunkStart:=0;
+
   while chunkStart<InSize do begin
     if InSize-chunkStart>LongWord(LZMA2_UNCOMPRESSED_MAX) then
       uncompSize:=LZMA2_UNCOMPRESSED_MAX else uncompSize:=InSize-chunkStart;
@@ -1228,9 +1309,12 @@ var
   posMask, litPosMask: LongWord; buf: array[0..4095] of Byte;
   limStr: TMemoryStream; chunk: TLZMADecState; ds, nOut: LongWord;
 begin
-  needDictReset:=True; lc:=3; lp:=0; pb:=2;
-  DictAlloc(dict,dictSize); DictReset(dict);
-  FillChar(probs,SizeOf(probs),0); state:=0;
+  needDictReset:=True; 
+  lc:=3; lp:=0; pb:=2;
+  DictAlloc(dict,dictSize);
+  DictReset(dict);
+  FillChar(probs,SizeOf(probs),0); 
+  state:=0;
   rep[0]:=0; rep[1]:=0; rep[2]:=0; rep[3]:=0;
   try
     while True do begin
@@ -1244,19 +1328,34 @@ begin
         b:=InStr.ReadByte; uncompSize:=uncompSize or LongWord(b); Inc(uncompSize);
         b:=InStr.ReadByte; compSize:=LongWord(b) shl 8;
         b:=InStr.ReadByte; compSize:=compSize or LongWord(b); Inc(compSize);
-        if ctrl>=$C0 then begin
-          b:=InStr.ReadByte; DecodeLZMAProps(b,lc,lp,pb);
-          posMask:=(1 shl pb)-1; litPosMask:=(1 shl lp)-1;
-          LZMAProbsInit(probs,lc,lp); state:=0;
-          rep[0]:=0; rep[1]:=0; rep[2]:=0; rep[3]:=0;
+        if ctrl>=$C0 then
+        begin
+          b:=InStr.ReadByte; 
+          DecodeLZMAProps(b,lc,lp,pb);
+          posMask:=(1 shl pb)-1; 
+          litPosMask:=(1 shl lp)-1;
+          LZMAProbsInit(probs,lc,lp); 
+          state:=0;
+          rep[0]:=0; 
+          rep[1]:=0; 
+          rep[2]:=0; 
+          rep[3]:=0;
           // NOTE: Properties byte is NOT counted in Compressed Size (per XZ LZMA2 spec)
-        end else if ctrl>=$A0 then begin
-          LZMAProbsInit(probs,lc,lp); state:=0;
-          rep[0]:=0; rep[1]:=0; rep[2]:=0; rep[3]:=0;
+        end else if ctrl>=$A0 then 
+        begin
+          LZMAProbsInit(probs,lc,lp);
+          state:=0;
+          rep[0]:=0; 
+          rep[1]:=0; 
+          rep[2]:=0;
+          rep[3]:=0;
         end;
         FillChar(chunk,SizeOf(chunk),0);
-        chunk.lc:=lc; chunk.lp:=lp; chunk.pb:=pb;
-        chunk.posMask:=posMask; chunk.litPosMask:=litPosMask;
+        chunk.lc:=lc; 
+        chunk.lp:=lp; 
+        chunk.pb:=pb;
+        chunk.posMask:=posMask; 
+        chunk.litPosMask:=litPosMask;
         Move(dict,chunk.dict,SizeOf(TLZDict));
         Move(probs,chunk.probs,SizeOf(TLZMAProbs));
         chunk.state:=state;
@@ -1266,19 +1365,29 @@ begin
         try
           limStr.CopyFrom(InStr,compSize); limStr.Position:=0;
           if not RCDecInit(chunk.rc,limStr) then raise ELZMAError.Create('LZMA2: bad range coder init');
-          left:=uncompSize; chunk.dict.Limit:=chunk.dict.Size; ds:=chunk.dict.Pos;
+          left:=uncompSize; 
+          chunk.dict.Limit:=chunk.dict.Size; 
+          ds:=chunk.dict.Pos;
           while left>0 do begin
             if chunk.dict.Pos+MATCH_LEN_MAX>chunk.dict.Size then begin
               nOut:=chunk.dict.Pos-ds;
-              if nOut>0 then begin OutStr.Write(chunk.dict.Buf[ds],nOut); Dec(left,nOut); end;
+              if nOut>0 then 
+              begin 
+                OutStr.Write(chunk.dict.Buf[ds],nOut); 
+                Dec(left,nOut); 
+              end;
               Move(chunk.dict.Buf[chunk.dict.Pos-LZ_DICT_REPEAT_MAX],chunk.dict.Buf[0],LZ_DICT_REPEAT_MAX);
-              chunk.dict.Pos:=LZ_DICT_REPEAT_MAX; chunk.dict.HasWrapped:=True;
-              chunk.dict.Limit:=chunk.dict.Size; ds:=chunk.dict.Pos;
+              chunk.dict.Pos:=LZ_DICT_REPEAT_MAX; 
+              chunk.dict.HasWrapped:=True;
+              chunk.dict.Limit:=chunk.dict.Size; 
+              ds:=chunk.dict.Pos;
               if left=0 then Break;
             end;
             if not LZMADecSymbol(chunk) then raise ELZMAError.Create('LZMA2: unexpected EOPM');
-            if Int64(chunk.dict.Pos-ds)>=Int64(left) then begin
-              chunk.dict.Pos:=ds+left; left:=0;
+            if Int64(chunk.dict.Pos-ds)>=Int64(left) then 
+            begin
+              chunk.dict.Pos:=ds+left; 
+              left:=0;
             end;
           end;
           nOut:=chunk.dict.Pos-ds;
@@ -1287,12 +1396,17 @@ begin
         Move(chunk.dict,dict,SizeOf(TLZDict));
         Move(chunk.probs,probs,SizeOf(TLZMAProbs));
         state:=chunk.state;
-        rep[0]:=chunk.rep[0]; rep[1]:=chunk.rep[1];
-        rep[2]:=chunk.rep[2]; rep[3]:=chunk.rep[3];
+        rep[0]:=chunk.rep[0]; 
+        rep[1]:=chunk.rep[1];
+        rep[2]:=chunk.rep[2];
+        rep[3]:=chunk.rep[3];
       end else begin
         if ctrl>2 then raise ELZMAError.Create('LZMA2: invalid control byte');
-        b:=InStr.ReadByte; compSize:=LongWord(b) shl 8;
-        b:=InStr.ReadByte; compSize:=compSize or LongWord(b); Inc(compSize);
+        b:=InStr.ReadByte; 
+        compSize:=LongWord(b) shl 8;
+        b:=InStr.ReadByte; 
+        compSize:=compSize or LongWord(b); 
+        Inc(compSize);
         left:=compSize;
         while left>0 do begin
           n:=left; if n>SizeOf(buf) then n:=SizeOf(buf);
@@ -1311,7 +1425,11 @@ end;
 
 procedure WriteVLI(OutStr: TStream; value: Int64);
 begin
-  while value>$7F do begin OutStr.WriteByte(Byte(value and $7F) or $80); value:=value shr 7; end;
+  while value>$7F do 
+  begin 
+    OutStr.WriteByte(Byte(value and $7F) or $80); 
+    value:=value shr 7; 
+  end;
   OutStr.WriteByte(Byte(value));
 end;
 
@@ -1338,11 +1456,15 @@ begin
   try
     ms.CopyFrom(InStr,0);
     OutStr.WriteByte(propsByte);
-    OutStr.WriteByte(dictSize and $FF); OutStr.WriteByte((dictSize shr 8) and $FF);
-    OutStr.WriteByte((dictSize shr 16) and $FF); OutStr.WriteByte((dictSize shr 24) and $FF);
+    OutStr.WriteByte(dictSize and $FF); 
+    OutStr.WriteByte((dictSize shr 8) and $FF);
+    OutStr.WriteByte((dictSize shr 16) and $FF); 
+    OutStr.WriteByte((dictSize shr 24) and $FF);
     for i:=0 to 7 do OutStr.WriteByte($FF);
     LZMA1EncodeRaw(ms.Memory, ms.Size, lc, lp, pb, 64, 32, mfkHC4, OutStr);
-  finally ms.Free; end;
+  finally 
+    ms.Free; 
+  end;
 end;
 
 procedure LZMADecompressStream(const InStr, OutStr: TStream);
@@ -1395,17 +1517,22 @@ begin
     bHdrSize:=bhMs.Size+4;
     PByte(bhMs.Memory)[0]:=Byte(bHdrSize div 4 - 1);  // spec: stored as (size/4)-1
     crc:=CRC32Update(0, PByte(bhMs.Memory), bhMs.Size);
-    bhMs.WriteByte(crc and $FF); bhMs.WriteByte((crc shr 8) and $FF);
-    bhMs.WriteByte((crc shr 16) and $FF); bhMs.WriteByte((crc shr 24) and $FF);
+    bhMs.WriteByte(crc and $FF); 
+    bhMs.WriteByte((crc shr 8) and $FF);
+    bhMs.WriteByte((crc shr 16) and $FF); 
+    bhMs.WriteByte((crc shr 24) and $FF);
     bHdrBytes:=bhMs.Size;
-    bhMs.Position:=0; OutStr.CopyFrom(bhMs, bhMs.Size);
+    bhMs.Position:=0; 
+    OutStr.CopyFrom(bhMs, bhMs.Size);
   finally bhMs.Free; end;
 end;
 
 function XZCheckSize(check: TXZCheckType): Integer;
 begin
   case check of
-    xzCRC32: Result:=4; xzCRC64: Result:=8; xzSHA256: Result:=32;
+    xzCRC32: Result:=4; 
+    xzCRC64: Result:=8; 
+    xzSHA256: Result:=32;
   else Result:=0;
   end;
 end;
@@ -1422,9 +1549,11 @@ var
   lc,lp,pb: Integer; bcjBuf: PByte; lzma2Ms, idxMs: TMemoryStream;
   packedSize, bHdrBytes: LongWord; crc: LongWord; tmp: array[0..5] of Byte;
   backwardSize, idxSize: LongWord;
-  sha: TSHA256Digest; crc64: QWord;
+  sha: TSHA256Digest; crc64: UInt64;
 begin
-  lc:=3; lp:=0; pb:=2;
+  lc:=3; 
+  lp:=0; 
+  pb:=2;
 
   // Apply BCJ forward then Delta forward (in-place on copy of input)
   if (bcj<>bcjNone) or (deltaDist>0) then begin
@@ -1610,16 +1739,24 @@ end;
 // ===========================================================================
 
 procedure LZMACompress(const InStr, OutStr: TStream);
-begin LZMACompressStream(InStr, OutStr); end;
+begin
+  LZMACompressStream(InStr, OutStr);
+end;
 
 procedure LZMADeCompress(const InStr, OutStr: TStream);
-begin LZMADecompressStream(InStr, OutStr); end;
+begin
+  LZMADecompressStream(InStr, OutStr);
+end;
 
 procedure LZMA2Compress(const InStr, OutStr: TStream);
-begin LZMA2CompressStream(InStr, OutStr); end;
+begin
+  LZMA2CompressStream(InStr, OutStr);
+end;
 
 procedure LZMA2DeCompress(const InStr, OutStr: TStream);
-begin LZMA2DecompressStream(InStr, OutStr); end;
+begin
+  LZMA2DecompressStream(InStr, OutStr);
+end;
 
 procedure LZMA2CompressEx(const InStr, OutStr: TStream; Level: Integer = 6;
                            Check: TXZCheckType = xzCRC32;
@@ -1637,6 +1774,70 @@ begin
                  preset.DictSizeProp, preset.MFKind, preset.NiceLen, preset.MaxDepth,
                  Check, BCJ, DeltaDist);
   finally ms.Free; end;
+end;
+
+function LZMA(const Uncompressed: AnsiString): AnsiString;
+var InStr, OutStr: TStringStream;
+begin
+  InStr := TStringStream.Create(Uncompressed);
+  OutStr := TStringStream.Create('');
+
+  try
+    LZMACompressStream(InStr, OutStr);
+  finally
+    InStr.Free;
+  end;
+
+  Result := OutStr.DataString;
+  OutStr.Free;
+end;
+
+function UnLZMA(const Compressed: AnsiString): AnsiString;
+var InStr, OutStr: TStringStream;
+begin
+  InStr := TStringStream.Create(Compressed);
+  OutStr := TStringStream.Create('');
+
+  try
+    LZMADeCompressStream(InStr, OutStr);
+  finally
+    InStr.Free;
+  end;
+
+  Result := OutStr.DataString;
+  OutStr.Free;
+end;
+
+function XZ(const Uncompressed: AnsiString): AnsiString;
+var InStr, OutStr: TStringStream;
+begin
+  InStr := TStringStream.Create(Uncompressed);
+  OutStr := TStringStream.Create('');
+
+  try
+    LZMA2CompressStream(InStr, OutStr);
+  finally
+    InStr.Free;
+  end;
+
+  Result := OutStr.DataString;
+  OutStr.Free;
+end;
+
+function UnXZ(const Compressed: AnsiString): AnsiString;
+var InStr, OutStr: TStringStream;
+begin
+  InStr := TStringStream.Create(Compressed);
+  OutStr := TStringStream.Create('');
+
+  try
+    LZMA2DeCompressStream(InStr, OutStr);
+  finally
+    InStr.Free;
+  end;
+
+  Result := OutStr.DataString;
+  OutStr.Free;
 end;
 
 
